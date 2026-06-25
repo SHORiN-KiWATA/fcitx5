@@ -660,7 +660,18 @@ void XIMServer::callback(xcb_im_client_t *client, xcb_im_input_context_t *xic,
             result = ic->keyEvent(event);
         }
         if (!result) {
-            xcb_im_forward_event(im(), xic, xevent);
+            // Don't forward key release of regular printable characters
+            // while composing. Forwarding releases triggers a sync race in
+            // the XIM client's FABRICATED flag handling that can cause
+            // character leaks under CJK locales with COMPOUND_TEXT encoding.
+            if (!(event.isRelease() &&
+                  !event.key().states().testAny(
+                      KeyStates{KeyState::Ctrl, KeyState::Alt,
+                                KeyState::Super, KeyState::Shift}) &&
+                  !ic->inputPanel().preedit().toString().empty() &&
+                  Key::keySymToUnicode(event.key().sym()) > 0x20)) {
+                xcb_im_forward_event(im(), xic, xevent);
+            }
         }
         break;
     }
