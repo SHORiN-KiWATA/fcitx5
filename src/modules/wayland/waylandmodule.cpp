@@ -17,7 +17,6 @@
 #include <string>
 #include <string_view>
 #include <tuple>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <fcitx-utils/handlertable.h>
@@ -227,11 +226,11 @@ WaylandModule::WaylandModule(fcitx::Instance *instance)
 void WaylandModule::reloadConfig() { readAsIni(config_, "conf/wayland.conf"); }
 
 bool WaylandModule::openConnection(const std::string &name) {
-    if (conns_.count(name)) {
+    if (conns_.contains(name)) {
         return false;
     }
 
-    if (auto defaultConnection = findValue(conns_, "")) {
+    if (auto *defaultConnection = findValue(conns_, "")) {
         if (name == defaultConnection->get()->realName()) {
             return false;
         }
@@ -266,7 +265,7 @@ bool WaylandModule::openConnectionSocketWithName(int fd,
                                                  const std::string &realName) {
     UnixFD guard = UnixFD::own(fd);
 
-    if (conns_.count(name)) {
+    if (conns_.contains(name)) {
         return false;
     }
 
@@ -286,6 +285,8 @@ bool WaylandModule::openConnectionSocketWithName(int fd,
         guard.release();
         newConnection = iter.first->second.get();
     } catch (const std::exception &e) {
+        FCITX_ERROR() << "Open wayland connection with socket failed: "
+                      << e.what();
     }
     if (newConnection) {
         refreshCanRestart();
@@ -343,6 +344,8 @@ bool WaylandModule::reopenConnectionSocket(const std::string &displayName,
             std::make_unique<WaylandConnection>(this, name, fd, displayName);
         guard.release();
     } catch (const std::exception &e) {
+        FCITX_ERROR() << "Open wayland connection: " << name
+                      << " failed: " << e.what();
     }
     if (newConnection) {
         // At this point connection is already constructed, now we try to
@@ -409,10 +412,10 @@ void WaylandModule::onConnectionClosed(WaylandConnection &conn) {
 }
 
 void WaylandModule::refreshCanRestart() {
-    setCanRestart(std::all_of(conns_.begin(), conns_.end(),
-                              [](const decltype(conns_)::value_type &conn) {
-                                  return !conn.second->isWaylandSocket();
-                              }));
+    setCanRestart(std::ranges::all_of(
+        conns_, [](const decltype(conns_)::value_type &conn) {
+            return !conn.second->isWaylandSocket();
+        }));
 }
 
 void WaylandModule::reloadXkbOption() {
@@ -425,7 +428,7 @@ void WaylandModule::reloadXkbOptionReal() {
     if (!isWaylandSession_) {
         return;
     }
-    auto connection = findValue(conns_, "");
+    auto *connection = findValue(conns_, "");
     if (!connection) {
         return;
     }
@@ -434,15 +437,15 @@ void WaylandModule::reloadXkbOptionReal() {
     std::optional<std::string> xkbOption = std::nullopt;
     if (isKDE5Plus()) {
 
-        auto dbusAddon = dbus();
+        auto *dbusAddon = dbus();
         if (!dbusAddon) {
             return;
         }
 
         fcitx::RawConfig config;
         readAsIni(config, StandardPathsType::Config, "kxkbrc");
-        auto model = config.valueByPath("Layout/Model");
-        auto options = config.valueByPath("Layout/Options");
+        const auto *model = config.valueByPath("Layout/Model");
+        const auto *options = config.valueByPath("Layout/Options");
         xkbOption = (options ? *options : "");
         instance_->setXkbParameters((*connection)->focusGroup()->display(),
                                     DEFAULT_XKB_RULES, model ? *model : "",
@@ -457,7 +460,7 @@ void WaylandModule::reloadXkbOptionReal() {
 
             gchar **value = g_settings_get_strv(settings.get(), "xkb-options");
             if (value) {
-                auto options = g_strjoinv(",", value);
+                auto *options = g_strjoinv(",", value);
                 xkbOption = (options ? options : "");
                 instance_->setXkbParameters(
                     (*connection)->focusGroup()->display(), DEFAULT_XKB_RULES,
@@ -469,7 +472,7 @@ void WaylandModule::reloadXkbOptionReal() {
         }
     }
 #ifdef ENABLE_X11
-    if (auto xcbAddon = xcb(); xcbAddon && xkbOption) {
+    if (auto *xcbAddon = xcb(); xcbAddon && xkbOption) {
         xcbAddon->call<IXCBModule::setXkbOption>(
             xcbAddon->call<IXCBModule::mainDisplay>(), *xkbOption);
     }
@@ -728,6 +731,8 @@ void WaylandModule::selfDiagnose() {
                   "see "
                   "https://fcitx-im.org/wiki/Using_Fcitx_5_on_Wayland#GNOME"));
         }
+    } else if (desktop == DesktopType::DEEPIN) {
+        // Per Deepin upstream request, do not show this message for them.
     } else if (desktop == DesktopType::UKUI) {
         // Per UkUI upstream request, do not show this message for them.
     } else {

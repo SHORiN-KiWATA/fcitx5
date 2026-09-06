@@ -19,7 +19,9 @@
 #include <fcitx/inputcontextproperty.h>
 #include <fcitx/inputmethodmanager.h>
 #include <fcitx/instance.h>
+#include <fcitx/tempmodemanager.h>
 #include <fcitx/userinterfacemanager.h>
+#include "fcitx-utils/connectableobject.h"
 #include "config.h"
 
 #ifdef ENABLE_KEYBOARD
@@ -172,6 +174,7 @@ public:
     AddonManager addonManager_;
     InputMethodManager imManager_{&this->addonManager_};
     UserInterfaceManager uiManager_{&this->addonManager_};
+    std::unique_ptr<TempModeManager> tempModeManager_;
     GlobalConfig globalConfig_;
     std::unordered_map<EventType,
                        std::unordered_map<EventWatcherPhase,
@@ -189,6 +192,7 @@ public:
     FCITX_DEFINE_SIGNAL_PRIVATE(Instance, OutputFilter);
     FCITX_DEFINE_SIGNAL_PRIVATE(Instance, KeyEventResult);
     FCITX_DEFINE_SIGNAL_PRIVATE(Instance, CheckUpdate);
+    FCITX_DEFINE_SIGNAL_PRIVATE(Instance, XkbStateMaskChanged);
 
     FactoryFor<InputState> inputStateFactory_{
         [this](InputContext &ic) { return new InputState(this, &ic); }};

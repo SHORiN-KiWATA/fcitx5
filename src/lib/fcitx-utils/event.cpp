@@ -7,15 +7,18 @@
  */
 
 #include "event.h"
+#include <sys/types.h>
 #include <cstdint>
-#include <cstring>
-#include <ctime>
 #include <memory>
 #include <stdexcept>
 #include <utility>
 #include "event_p.h"
 #include "eventloopinterface.h"
 #include "macros.h"
+
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
 
 namespace fcitx {
 
@@ -69,7 +72,7 @@ bool EventLoop::exec() {
 
 void EventLoop::exit() {
     FCITX_D();
-    return d->impl_->exit();
+    d->impl_->exit();
 }
 
 std::unique_ptr<EventSourceIO> EventLoop::addIOEvent(int fd, IOEventFlags flags,

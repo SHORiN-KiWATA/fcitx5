@@ -120,6 +120,10 @@ bool XCBTrayWindow::filterEvent(xcb_generic_event_t *event) {
                            ConstrainAdjustment::Flip);
             } else if (press->detail == XCB_BUTTON_INDEX_1) {
                 ui_->parent()->instance()->toggle();
+            } else if (press->detail == XCB_BUTTON_INDEX_4) {
+                ui_->parent()->instance()->enumerate(true);
+            } else if (press->detail == XCB_BUTTON_INDEX_5) {
+                ui_->parent()->instance()->enumerate(false);
             }
             return true;
         }
@@ -370,7 +374,9 @@ void XCBTrayWindow::paint(cairo_t *c) {
         icon, label, std::min(height(), width()), ui_->parent());
 
     cairo_save(c);
-    cairo_set_operator(c, CAIRO_OPERATOR_SOURCE);
+    cairo_set_operator(c, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(c);
+    cairo_set_operator(c, CAIRO_OPERATOR_OVER);
     double scaleW = 1.0;
     double scaleH = 1.0;
     if (image.width() != width() || image.height() != height()) {
@@ -385,10 +391,9 @@ void XCBTrayWindow::paint(cairo_t *c) {
     int aw = scaleW * image.width();
     int ah = scaleH * image.height();
 
-    cairo_scale(c, scaleW, scaleH);
-    cairo_set_source_surface(c, image, (width() - aw) / 2.0,
-                             (height() - ah) / 2.0);
-    cairo_paint(c);
+    image.paintRegion(c, 0, 0, image.width(), image.height(),
+                      (width() - aw) / 2.0, (height() - ah) / 2.0,
+                      image.width() * scaleW, image.height() * scaleH);
     cairo_restore(c);
 }
 
@@ -411,8 +416,7 @@ void XCBTrayWindow::render() {
     }
     auto *cr = cairo_create(surface_.get());
     if (trayDepth_ == 32) {
-        cairo_set_source_rgba(cr, 0, 0, 0, 0);
-        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
         cairo_paint(cr);
     }
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);

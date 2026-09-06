@@ -15,7 +15,7 @@ public:
     static constexpr const char *interface = "wl_data_device_manager";
     static constexpr const wl_interface *const wlInterface =
         &wl_data_device_manager_interface;
-    static constexpr const uint32_t version = 3;
+    static constexpr const uint32_t version = 4;
     using wlType = wl_data_device_manager;
     operator wl_data_device_manager *() { return data_.get(); }
     WlDataDeviceManager(wlType *data);
@@ -25,8 +25,12 @@ public:
     auto actualVersion() const { return version_; }
     void *userData() const { return userData_; }
     void setUserData(void *userData) { userData_ = userData; }
+#if defined(WL_DATA_DEVICE_MANAGER_CREATE_DATA_SOURCE_SINCE_VERSION)
     WlDataSource *createDataSource();
+#endif
+#if defined(WL_DATA_DEVICE_MANAGER_GET_DATA_DEVICE_SINCE_VERSION)
     WlDataDevice *getDataDevice(WlSeat *seat);
+#endif
 
 private:
     static void destructor(wl_data_device_manager *);

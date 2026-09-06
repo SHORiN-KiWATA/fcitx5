@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <tuple>
 #include <utility>
+#include <vector>
 #include <cairo.h>
 #include <pango/pango-context.h>
 #include <pango/pango-font.h>
@@ -24,6 +25,12 @@
 #include <xcb/xcb_icccm.h>
 #include <xcb/xcb_keysyms.h>
 #include <xcb/xproto.h>
+#include <yoga/YGEnums.h>
+#include <yoga/YGNode.h>
+#include <yoga/YGNodeLayout.h>
+#include <yoga/YGNodeStyle.h>
+#include <yoga/YGValue.h>
+#include "fcitx-utils/color.h"
 #include "fcitx-utils/connectableobject.h"
 #include "fcitx-utils/eventloopinterface.h"
 #include "fcitx-utils/log.h"
@@ -36,17 +43,19 @@
 #include "fcitx/userinterfacemanager.h"
 #include "common.h"
 #include "theme.h"
+#include "xcb_public.h"
 #include "xcbui.h"
 #include "xcbwindow.h"
 
 namespace fcitx::classicui {
 
 XCBMenu::XCBMenu(XCBUI *ui, MenuPool *pool, Menu *menu)
-    : XCBWindow(ui), pool_(pool), menu_(menu) {
+    : XCBWindow(ui), pool_(pool), menu_(menu),
+      atomBlur_(ui_->parent()->xcb()->call<IXCBModule::atom>(
+          ui_->displayName(), "_KDE_NET_WM_BLUR_BEHIND_REGION", false)) {
     fontMap_.reset(pango_cairo_font_map_new());
-    fontMapDefaultDPI_ = pango_cairo_font_map_get_resolution(
-        PANGO_CAIRO_FONT_MAP(fontMap_.get()));
     context_.reset(pango_font_map_create_context(fontMap_.get()));
+    rootNode_.reset(YGNodeNew());
     if (auto *ic = ui_->parent()->instance()->mostRecentInputContext()) {
         lastRelevantIc_ = ic->watch();
     }
@@ -105,8 +114,9 @@ bool XCBMenu::filterEvent(xcb_generic_event_t *event) {
         }
         if (auto *menu =
                 childByPosition(buttonPress->root_x, buttonPress->root_y)) {
-            menu->handleButtonPress(buttonPress->root_x - menu->x_,
-                                    buttonPress->root_y - menu->y_);
+            menu->handleButtonPress(
+                menu->logicalFromPhysical(buttonPress->root_x - menu->x_),
+                menu->logicalFromPhysical(buttonPress->root_y - menu->y_));
         } else {
             hideAll();
             return true;
@@ -120,8 +130,9 @@ bool XCBMenu::filterEvent(xcb_generic_event_t *event) {
         }
 
         if (auto *menu = childByPosition(motion->root_x, motion->root_y)) {
-            menu->handleMotionNotify(motion->root_x - menu->x_,
-                                     motion->root_y - menu->y_);
+            menu->handleMotionNotify(
+                menu->logicalFromPhysical(motion->root_x - menu->x_),
+                menu->logicalFromPhysical(motion->root_y - menu->y_));
         }
         return true;
     }
@@ -156,6 +167,8 @@ bool XCBMenu::filterEvent(xcb_generic_event_t *event) {
         }
         break;
     }
+    default:
+        break;
     }
     return false;
 }
@@ -279,7 +292,7 @@ XCBMenu *XCBMenu::childByPosition(int rootX, int rootY) {
     while (result) {
         Rect rect;
         rect.setPosition(result->x_, result->y_)
-            .setSize(result->width_, result->height_);
+            .setSize(result->physicalWidth_, result->physicalHeight_);
         if (rect.contains(rootX, rootY)) {
             break;
         }
@@ -353,7 +366,8 @@ void XCBMenu::setHoveredIndex(int idx) {
                             // FCITX_INFO() << this << " in timer show submenu "
                             // << newMenu;
                             newMenu->show(
-                                item.first->region_.translated(x_, y_),
+                                physicalFromLogical(item.first->region_)
+                                    .translated(x_, y_),
                                 ConstrainAdjustment::Slide);
                         }
                     } else {
@@ -383,18 +397,70 @@ std::pair<MenuItem *, Action *> XCBMenu::actionAt(size_t index) {
 }
 
 void XCBMenu::updateDPI(int x, int y) {
-    dpi_ = ui_->dpiByPosition(x, y);
+    setScale(scaleForDPI(ui_->dpiByPosition(x, y)));
+}
 
-    // Unlike pango cairo context, Cairo font map does not accept negative dpi.
-    // Restore to default value instead.
-    if (dpi_ < 0) {
-        pango_cairo_font_map_set_resolution(
-            PANGO_CAIRO_FONT_MAP(fontMap_.get()), fontMapDefaultDPI_);
-    } else {
-        pango_cairo_font_map_set_resolution(
-            PANGO_CAIRO_FONT_MAP(fontMap_.get()), dpi_);
+void XCBMenu::updateBlur() {
+    if (!atomBlur_) {
+        return;
     }
-    pango_cairo_context_set_resolution(context_.get(), dpi_);
+
+    const auto width =
+        static_cast<unsigned int>(YGNodeLayoutGetWidth(rootNode_.get()));
+    const auto height =
+        static_cast<unsigned int>(YGNodeLayoutGetHeight(rootNode_.get()));
+    Rect logicalRect(0, 0, width, height);
+    auto &theme = ui_->parent()->theme();
+    const auto &menu = *theme.menu;
+    shrink(logicalRect, *menu.blurMargin);
+    if (!*menu.enableBlur || logicalRect.isEmpty()) {
+        xcb_delete_property(ui_->connection(), wid_, atomBlur_);
+        return;
+    }
+
+    const auto rect = physicalFromLogical(logicalRect);
+    std::vector<uint32_t> data;
+    if (menu.blurMask->empty()) {
+        data = {static_cast<uint32_t>(rect.left()),
+                static_cast<uint32_t>(rect.top()),
+                static_cast<uint32_t>(rect.width()),
+                static_cast<uint32_t>(rect.height())};
+    } else {
+        const auto region =
+            theme.mask(theme.menuBlurMaskConfig(), width, height);
+        for (const auto &maskRect : region) {
+            const auto physicalRect = physicalFromLogical(maskRect);
+            data.push_back(physicalRect.left());
+            data.push_back(physicalRect.top());
+            data.push_back(physicalRect.width());
+            data.push_back(physicalRect.height());
+        }
+    }
+    xcb_change_property(ui_->connection(), XCB_PROP_MODE_REPLACE, wid_,
+                        atomBlur_, XCB_ATOM_CARDINAL, 32, data.size(),
+                        data.data());
+}
+
+void XCBMenu::renderYogaNode(cairo_t *cr, YGNodeRef node) {
+    if (!node) {
+        return;
+    }
+
+    cairo_save(cr);
+    cairo_translate(cr, YGNodeLayoutGetLeft(node), YGNodeLayoutGetTop(node));
+
+    cairoSetSourceColor(cr, node == rootNode_.get() ? Color(0, 0, 255, 128)
+                                                    : Color(255, 0, 0, 76));
+    cairo_rectangle(cr, 0, 0, YGNodeLayoutGetWidth(node),
+                    YGNodeLayoutGetHeight(node));
+    cairo_stroke(cr);
+
+    const auto childCount = YGNodeGetChildCount(node);
+    for (uint32_t i = 0; i < childCount; i++) {
+        renderYogaNode(cr, YGNodeGetChild(node, i));
+    }
+
+    cairo_restore(cr);
 }
 
 void XCBMenu::update() {
@@ -406,15 +472,7 @@ void XCBMenu::update() {
                  .dummyInputContext();
     }
 
-    // Size hint:
-    // Height = Margin + Content + Spacing
-    // Width = Margin + Max content.
-
-    auto updateIfLarger = [](size_t &m, size_t n) {
-        if (n > m) {
-            m = n;
-        }
-    };
+    auto updateIfLarger = [](size_t &m, size_t n) { m = std::max(n, m); };
 
     auto actions = menu_->actions();
     while (items_.size() < actions.size()) {
@@ -437,12 +495,9 @@ void XCBMenu::update() {
     size_t maxItemWidth = 0;
     size_t maxItemHeight = 0;
 
-    bool hasCheckable =
-        std::any_of(actions.begin(), actions.end(), [](const Action *action) {
-            return action->isCheckable() && !action->isSeparator();
-        });
-    // We need multiple pass to get the size and location right.
-    // Pass 1: get max size of all items, and set size.
+    bool hasCheckable = std::ranges::any_of(actions, [](const Action *action) {
+        return action->isCheckable() && !action->isSeparator();
+    });
     for (auto *action : actions) {
         auto &item = items_[i];
         item.isHighlight_ =
@@ -478,98 +533,135 @@ void XCBMenu::update() {
         updateIfLarger(maxItemHeight, itemHeight);
     }
 
-    size_t width = *theme.menu->contentMargin->marginLeft;
-    size_t height = *theme.menu->contentMargin->marginTop;
-    bool prevIsSeparator = false;
-    for (auto &item : items_) {
+    YGNodeRemoveAllChildren(rootNode_.get());
+    YGNodeReset(rootNode_.get());
+    YGNodeStyleSetFlexDirection(rootNode_.get(), YGFlexDirectionColumn);
+    YGNodeStyleSetPadding(rootNode_.get(), YGEdgeLeft,
+                          *theme.menu->contentMargin->marginLeft);
+    YGNodeStyleSetPadding(rootNode_.get(), YGEdgeRight,
+                          *theme.menu->contentMargin->marginRight);
+    YGNodeStyleSetPadding(rootNode_.get(), YGEdgeTop,
+                          *theme.menu->contentMargin->marginTop);
+    YGNodeStyleSetPadding(rootNode_.get(), YGEdgeBottom,
+                          *theme.menu->contentMargin->marginBottom);
+    YGNodeStyleSetMinWidth(rootNode_.get(), 1);
+    YGNodeStyleSetMinHeight(rootNode_.get(), 1);
+    YGNodeStyleSetGap(rootNode_.get(), YGGutterRow, *theme.menu->spacing);
+
+    for (size_t index = 0; index < items_.size(); index++) {
+        auto &item = items_[index];
+        YGNodeRemoveAllChildren(item.self_.get());
+        YGNodeRemoveAllChildren(item.leading_.get());
+        YGNodeReset(item.self_.get());
+        YGNodeReset(item.leading_.get());
+        YGNodeReset(item.checkBox_.get());
+        YGNodeReset(item.text_.get());
+        YGNodeReset(item.subMenu_.get());
+
         if (item.isSeparator_) {
-            item.layoutX_ = width;
-            item.layoutY_ = height;
-            height += (separator.isImage() ? 2 : separator.height());
-            prevIsSeparator = true;
+            YGNodeStyleSetHeight(item.self_.get(), separator.isPattern()
+                                                       ? 2
+                                                       : separator.height());
+            YGNodeInsertChild(rootNode_.get(), item.self_.get(), index);
             continue;
         }
 
-        if (!prevIsSeparator) {
-            height += *theme.menu->spacing;
+        YGNodeStyleSetFlexDirection(item.self_.get(), YGFlexDirectionRow);
+        YGNodeStyleSetJustifyContent(item.self_.get(), YGJustifySpaceBetween);
+        YGNodeStyleSetAlignItems(item.self_.get(), YGAlignCenter);
+        YGNodeStyleSetWidth(item.self_.get(), maxItemWidth);
+        YGNodeStyleSetHeight(item.self_.get(), maxItemHeight);
+        YGNodeStyleSetMargin(item.self_.get(), YGEdgeLeft,
+                             *textMargin.marginLeft);
+        YGNodeStyleSetMargin(item.self_.get(), YGEdgeRight,
+                             *textMargin.marginRight);
+        YGNodeStyleSetMargin(item.self_.get(), YGEdgeTop,
+                             *textMargin.marginTop);
+        YGNodeStyleSetMargin(item.self_.get(), YGEdgeBottom,
+                             *textMargin.marginBottom);
+
+        YGNodeStyleSetFlexDirection(item.leading_.get(), YGFlexDirectionRow);
+        YGNodeStyleSetAlignItems(item.leading_.get(), YGAlignCenter);
+        if (hasCheckable) {
+            YGNodeStyleSetWidth(item.checkBox_.get(), checkBox.width());
+            YGNodeStyleSetHeight(item.checkBox_.get(), checkBox.height());
+            YGNodeInsertChild(item.leading_.get(), item.checkBox_.get(), 0);
         }
-
-        item.region_
-            .setPosition(
-                width + *textMargin.marginLeft - *highlightMargin.marginLeft,
-                height + *textMargin.marginTop - *highlightMargin.marginTop)
-            .setSize(maxItemWidth + *highlightMargin.marginLeft +
-                         *highlightMargin.marginRight,
-                     maxItemHeight + *highlightMargin.marginTop +
-                         *highlightMargin.marginTop);
-        item.layoutX_ = width + *textMargin.marginLeft +
-                        (hasCheckable ? checkBox.width() : 0);
-        item.layoutY_ = height + *textMargin.marginTop +
-                        (maxItemHeight - item.textHeight_) / 2.0;
-        item.checkBoxX_ = width + *textMargin.marginLeft;
-        item.checkBoxY_ = height + *textMargin.marginTop +
-                          (maxItemHeight - checkBox.height()) / 2.0;
-        item.subMenuX_ = width + maxItemWidth - subMenu.width();
-        item.subMenuY_ = height + *textMargin.marginTop +
-                         (maxItemHeight - subMenu.height()) / 2.0;
-
-        height +=
-            maxItemHeight + *textMargin.marginTop + *textMargin.marginBottom;
+        YGNodeStyleSetWidth(item.text_.get(), item.textWidth_);
+        YGNodeStyleSetHeight(item.text_.get(), item.textHeight_);
+        YGNodeStyleSetWidth(item.subMenu_.get(), subMenu.width());
+        YGNodeStyleSetHeight(item.subMenu_.get(), subMenu.height());
+        YGNodeInsertChild(item.leading_.get(), item.text_.get(), hasCheckable);
+        YGNodeInsertChild(item.self_.get(), item.leading_.get(), 0);
+        YGNodeInsertChild(item.self_.get(), item.subMenu_.get(), 1);
+        YGNodeInsertChild(rootNode_.get(), item.self_.get(), index);
     }
 
-    width += maxItemWidth + *textMargin.marginLeft + *textMargin.marginRight +
-             *theme.menu->contentMargin->marginRight;
-    height += *theme.menu->contentMargin->marginBottom;
+    YGNodeCalculateLayout(rootNode_.get(), YGUndefined, YGUndefined,
+                          YGDirectionLTR);
+    const auto width =
+        static_cast<unsigned int>(YGNodeLayoutGetWidth(rootNode_.get()));
+    const auto height =
+        static_cast<unsigned int>(YGNodeLayoutGetHeight(rootNode_.get()));
 
-    updateIfLarger(width, 1);
-    updateIfLarger(height, 1);
-
+    const auto oldPhysicalWidth = physicalWidth_;
+    const auto oldPhysicalHeight = physicalHeight_;
     resize(width, height);
+    if (physicalWidth_ != oldPhysicalWidth ||
+        physicalHeight_ != oldPhysicalHeight) {
+        updateBlur();
+    }
 
     cairo_t *c = cairo_create(prerender());
-
-    cairo_set_operator(c, CAIRO_OPERATOR_SOURCE);
-    theme.paint(c, *theme.menu->background, width, height, /*alpha=*/1.0,
-                /*scale=*/1.0);
+    cairo_set_operator(c, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(c);
     cairo_set_operator(c, CAIRO_OPERATOR_OVER);
-    for (const auto &item : items_) {
+    theme.paint(c, *theme.menu->background, 0, 0, width, height, /*alpha=*/1.0);
+    for (auto &item : items_) {
         if (item.isSeparator_) {
-            cairo_save(c);
-            cairo_translate(c, item.layoutX_, item.layoutY_);
             const ThemeImage &separator =
                 theme.loadBackground(*theme.menu->separator);
             theme.paint(c, *theme.menu->separator,
+                        absolute<YGNodeLayoutGetLeft>(item.self_.get()),
+                        absolute<YGNodeLayoutGetTop>(item.self_.get()),
                         width - *theme.menu->contentMargin->marginLeft -
                             *theme.menu->contentMargin->marginRight,
-                        (separator.isImage() ? 2 : -1), /*alpha=*/1.0,
-                        /*scale=*/1.0);
-            cairo_restore(c);
+                        (separator.isPattern() ? 2 : -1), /*alpha=*/1.0);
             continue;
         }
 
+        const auto itemLeft = absolute<YGNodeLayoutGetLeft>(item.self_.get());
+        const auto itemTop = absolute<YGNodeLayoutGetTop>(item.self_.get());
+        const auto itemWidth = YGNodeLayoutGetWidth(item.self_.get());
+        const auto itemHeight = YGNodeLayoutGetHeight(item.self_.get());
+        item.region_
+            .setPosition(itemLeft - *highlightMargin.marginLeft,
+                         itemTop - *highlightMargin.marginTop)
+            .setSize(itemWidth + *highlightMargin.marginLeft +
+                         *highlightMargin.marginRight,
+                     itemHeight + *highlightMargin.marginTop +
+                         *highlightMargin.marginBottom);
         if (item.isHighlight_) {
-            cairo_save(c);
-            cairo_translate(c, item.region_.left(), item.region_.top());
-            theme.paint(c, *theme.menu->highlight, item.region_.width(),
+            theme.paint(c, *theme.menu->highlight, item.region_.left(),
+                        item.region_.top(), item.region_.width(),
                         item.region_.height(),
-                        /*alpha=*/1.0, /*scale=*/1.0);
-            cairo_restore(c);
+                        /*alpha=*/1.0);
         }
 
         if (item.isChecked_) {
-            cairo_save(c);
-            cairo_translate(c, item.checkBoxX_, item.checkBoxY_);
-            theme.paint(c, *theme.menu->checkBox, -1, -1, /*alpha=*/1.0,
-                        /*scale=*/1.0);
-            cairo_restore(c);
+            theme.paint(c, *theme.menu->checkBox,
+                        absolute<YGNodeLayoutGetLeft>(item.checkBox_.get()),
+                        absolute<YGNodeLayoutGetTop>(item.checkBox_.get()), -1,
+                        -1,
+                        /*alpha=*/1.0);
         }
 
         if (item.hasSubMenu_) {
-            cairo_save(c);
-            cairo_translate(c, item.subMenuX_, item.subMenuY_);
-            theme.paint(c, *theme.menu->subMenu, -1, -1, /*alpha=*/1.0,
-                        /*scale=*/1.0);
-            cairo_restore(c);
+            theme.paint(c, *theme.menu->subMenu,
+                        absolute<YGNodeLayoutGetLeft>(item.subMenu_.get()),
+                        absolute<YGNodeLayoutGetTop>(item.subMenu_.get()), -1,
+                        -1,
+                        /*alpha=*/1.0);
         }
 
         cairo_save(c);
@@ -578,9 +670,14 @@ void XCBMenu::update() {
         } else {
             cairoSetSourceColor(c, theme.menuText());
         }
-        cairo_translate(c, item.layoutX_, item.layoutY_);
+        cairo_translate(c, absolute<YGNodeLayoutGetLeft>(item.text_.get()),
+                        absolute<YGNodeLayoutGetTop>(item.text_.get()));
         pango_cairo_show_layout(c, item.layout_.get());
         cairo_restore(c);
+    }
+
+    if (classicui_logcategory().checkLogLevel(Debug)) {
+        renderYogaNode(c, rootNode_.get());
     }
 
     cairo_destroy(c);
@@ -593,7 +690,7 @@ void XCBMenu::postCreateWindow() {
         ui_->ewmh()->_NET_WM_WINDOW_TYPE) {
         uint32_t types[] = {ui_->ewmh()->_NET_WM_WINDOW_TYPE_MENU,
                             ui_->ewmh()->_NET_WM_WINDOW_TYPE_POPUP_MENU};
-        xcb_ewmh_set_wm_window_type(ui_->ewmh(), wid_, 1, types);
+        xcb_ewmh_set_wm_window_type(ui_->ewmh(), wid_, 2, types);
     }
 
     if (ui_->ewmh()->_NET_WM_PID) {
@@ -664,6 +761,7 @@ void XCBMenu::show(Rect rect, ConstrainAdjustment adjustY) {
     int y = rect.top();
     updateDPI(x, y);
     update();
+    updateBlur();
     const Rect *closestScreen = nullptr;
     int shortestDistance = INT_MAX;
     for (const auto &rect : ui_->screenRects()) {
@@ -677,27 +775,24 @@ void XCBMenu::show(Rect rect, ConstrainAdjustment adjustY) {
     x = x + rect.width();
 
     if (closestScreen) {
-
-        if (x + width() > closestScreen->right()) {
-            x = rect.left() - width();
+        if (x + physicalWidth_ > closestScreen->right()) {
+            x = rect.left() - physicalWidth_;
         }
 
         switch (adjustY) {
         case ConstrainAdjustment::Slide:
-            if (y + height() > closestScreen->bottom()) {
-                y = closestScreen->bottom() - height();
+            if (y + physicalHeight_ > closestScreen->bottom()) {
+                y = closestScreen->bottom() - physicalHeight_;
             }
             break;
         case ConstrainAdjustment::Flip:
-            if (y + height() > closestScreen->bottom()) {
-                y = rect.top() - height();
+            if (y + physicalHeight_ > closestScreen->bottom()) {
+                y = rect.top() - physicalHeight_;
             }
             break;
         };
 
-        if (y < closestScreen->top()) {
-            y = closestScreen->top();
-        }
+        y = std::max(y, closestScreen->top());
     }
 
     xcb_params_configure_window_t wc;

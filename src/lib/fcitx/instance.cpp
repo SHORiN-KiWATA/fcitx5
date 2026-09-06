@@ -519,7 +519,7 @@ InputState::InputState(InstancePrivate *d, InputContext *ic)
 }
 
 void InputState::showInputMethodInformation(const std::string &name) {
-    ic_->inputPanel().setAuxUp(Text(name));
+    ic_->inputPanel().setOverlayMessage(Text(name));
     ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
     lastInfo_ = name;
     imInfoTimer_ = d_ptr->eventLoop_.addTimeEvent(
@@ -615,11 +615,9 @@ void InputState::hideInputMethodInfo() {
     }
     imInfoTimer_.reset();
     auto &panel = ic_->inputPanel();
-    if (panel.auxDown().empty() && panel.preedit().empty() &&
-        panel.clientPreedit().empty() &&
-        (!panel.candidateList() || panel.candidateList()->empty()) &&
-        panel.auxUp().size() == 1 && panel.auxUp().stringAt(0) == lastInfo_) {
-        panel.reset();
+    if (panel.overlayMessage().size() == 1 &&
+        panel.overlayMessage().stringAt(0) == lastInfo_) {
+        panel.setOverlayMessage(Text());
         ic_->updateUserInterface(UserInterfaceComponent::InputPanel);
     }
 }
@@ -664,6 +662,11 @@ Instance::Instance(int argc, char **argv) {
         throw InstanceQuietQuit();
     }
 
+    // Start logging after quietQuit to avoid spamming the log with version
+    // information when user just want to see the version.
+    FCITX_INFO() << "Starting fcitx5 " << Instance::version();
+    FCITX_LOG_IF(Info, isInFlatpak()) << "Running inside flatpak.";
+
     if (arg.runAsDaemon) {
         initAsDaemon();
     }
@@ -680,6 +683,7 @@ Instance::Instance(int argc, char **argv) {
     d->addonManager_.setInstance(this);
     d->addonManager_.setAddonOptions(arg.addonOptions_);
     d->icManager_.setInstance(this);
+    d->tempModeManager_ = std::make_unique<TempModeManager>(this);
     d->connections_.emplace_back(
         d->imManager_.connect<InputMethodManager::CurrentGroupAboutToChange>(
             [this, d](const std::string &lastGroup) {
@@ -1284,6 +1288,7 @@ Instance::Instance(int argc, char **argv) {
 
 Instance::~Instance() {
     FCITX_D();
+    d->tempModeManager_.reset();
     d->icManager_.finalize();
     d->addonManager_.unload();
     d->notifications_ = nullptr;
@@ -1580,14 +1585,13 @@ bool Instance::canRestart() const {
     FCITX_D();
     const auto &addonNames = d->addonManager_.loadedAddonNames();
     return d->binaryMode_ &&
-           std::all_of(addonNames.begin(), addonNames.end(),
-                       [d](const std::string &name) {
-                           auto *addon = d->addonManager_.lookupAddon(name);
-                           if (!addon) {
-                               return true;
-                           }
-                           return addon->canRestart();
-                       });
+           std::ranges::all_of(addonNames, [d](const std::string &name) {
+               auto *addon = d->addonManager_.lookupAddon(name);
+               if (!addon) {
+                   return true;
+               }
+               return addon->canRestart();
+           });
 }
 
 InstancePrivate *Instance::privateData() {
@@ -1623,6 +1627,11 @@ InputMethodManager &Instance::inputMethodManager() {
 const InputMethodManager &Instance::inputMethodManager() const {
     FCITX_D();
     return d->imManager_;
+}
+
+TempModeManager &Instance::tempModeManager() {
+    FCITX_D();
+    return *d->tempModeManager_;
 }
 
 UserInterfaceManager &Instance::userInterfaceManager() {
@@ -1716,11 +1725,11 @@ Instance::watchEvent(EventType type, EventWatcherPhase phase,
 
 bool groupContains(const InputMethodGroup &group, const std::string &name) {
     const auto &list = group.inputMethodList();
-    auto iter = std::find_if(list.begin(), list.end(),
-                             [&name](const InputMethodGroupItem &item) {
-                                 return item.name() == name;
-                             });
-    return iter != list.end();
+    auto iter =
+        std::ranges::find_if(list, [&name](const InputMethodGroupItem &item) {
+            return item.name() == name;
+        });
+    return iter != std::ranges::end(list);
 }
 
 std::string Instance::inputMethod(InputContext *ic) {
@@ -2099,11 +2108,11 @@ void Instance::setCurrentInputMethod(InputContext *ic, const std::string &name,
 
     auto &imManager = inputMethodManager();
     const auto &imList = imManager.currentGroup().inputMethodList();
-    auto iter = std::find_if(imList.begin(), imList.end(),
-                             [&name](const InputMethodGroupItem &item) {
-                                 return item.name() == name;
-                             });
-    if (iter == imList.end()) {
+    auto iter =
+        std::ranges::find_if(imList, [&name](const InputMethodGroupItem &item) {
+            return item.name() == name;
+        });
+    if (iter == std::ranges::end(imList)) {
         return;
     }
 
@@ -2602,13 +2611,34 @@ void Instance::updateXkbStateMask(const std::string &display,
                                   uint32_t depressed_mods,
                                   uint32_t latched_mods, uint32_t locked_mods) {
     FCITX_D();
-    d->stateMask_[display] =
-        std::make_tuple(depressed_mods, latched_mods, locked_mods);
+    auto oldMask = xkbStateMask(display);
+    auto &newMask = d->stateMask_[display];
+    newMask = std::make_tuple(depressed_mods, latched_mods, locked_mods);
+    if (oldMask == newMask) {
+        return;
+    }
+    emit<Instance::XkbStateMaskChanged>(display, oldMask, newMask);
 }
 
 void Instance::clearXkbStateMask(const std::string &display) {
     FCITX_D();
-    d->stateMask_.erase(display);
+    auto oldMask = xkbStateMask(display);
+    if (!oldMask.has_value()) {
+        return;
+    }
+    bool changed = d->stateMask_.erase(display) > 0;
+    if (changed) {
+        emit<XkbStateMaskChanged>(display, oldMask, std::nullopt);
+    }
+}
+
+std::optional<std::tuple<uint32_t, uint32_t, uint32_t>>
+Instance::xkbStateMask(const std::string &display) const {
+    FCITX_D();
+    if (const auto *mask = findValue(d->stateMask_, display)) {
+        return *mask;
+    }
+    return std::nullopt;
 }
 
 const char *Instance::version() { return FCITX_VERSION_STRING; }

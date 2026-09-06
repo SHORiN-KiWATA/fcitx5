@@ -38,7 +38,6 @@ private:
                            const Rect *closestScreen) const;
 
     xcb_atom_t atomBlur_;
-    int dpi_ = -1;
 };
 
 } // namespace fcitx::classicui

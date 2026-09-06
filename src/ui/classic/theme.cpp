@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -19,6 +20,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 #include <cairo.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -26,6 +28,7 @@
 #include <gio/gunixinputstream.h>
 #include <glib.h>
 #include <glibconfig.h>
+#include <librsvg/rsvg.h>
 #include <pango/pango-font.h>
 #include <pango/pango-fontmap.h>
 #include <pango/pango-layout.h>
@@ -100,7 +103,7 @@ cairo_status_t readFromFd(void *closure, unsigned char *data,
     return CAIRO_STATUS_SUCCESS;
 }
 
-cairo_surface_t *pixBufToCairoSurface(GdkPixbuf *image) {
+ThemeImage::CairoSurface pixBufToCairoSurface(GdkPixbuf *image) {
     cairo_format_t format;
     cairo_surface_t *surface;
 
@@ -167,7 +170,7 @@ cairo_surface_t *pixBufToCairoSurface(GdkPixbuf *image) {
 
 #define MULT(d, c, a, t)                                                       \
     G_STMT_START {                                                             \
-        (t) = (c) * (a) + 0x80;                                                \
+        (t) = ((c) * (a)) + 0x80;                                              \
         (d) = (((t) >> 8) + (t)) >> 8;                                         \
     }                                                                          \
     G_STMT_END
@@ -197,10 +200,11 @@ cairo_surface_t *pixBufToCairoSurface(GdkPixbuf *image) {
     }
 
     cairo_surface_mark_dirty(surface);
-    return surface;
+    return ThemeImage::CairoSurface{surface};
 }
 
-cairo_surface_t *loadImage(UnixFD &file, const std::filesystem::path &path) {
+ThemeImage::CairoSurface loadImage(UnixFD &file,
+                                   const std::filesystem::path &path) {
     if (file.fd() < 0) {
         return nullptr;
     }
@@ -215,7 +219,7 @@ cairo_surface_t *loadImage(UnixFD &file, const std::filesystem::path &path) {
             g_clear_pointer(&surface, cairo_surface_destroy);
             return nullptr;
         }
-        return surface;
+        return ThemeImage::CairoSurface{surface};
     }
 
     GObjectUniquePtr<GInputStream> stream(
@@ -230,8 +234,48 @@ cairo_surface_t *loadImage(UnixFD &file, const std::filesystem::path &path) {
         return nullptr;
     }
 
-    auto *surface = pixBufToCairoSurface(image.get());
-    return surface;
+    return pixBufToCairoSurface(image.get());
+}
+
+std::optional<std::pair<int, int>> svgSize(RsvgHandle *svg) {
+    double w = 0;
+    double h = 0;
+    if (rsvg_handle_get_intrinsic_size_in_pixels(svg, &w, &h)) {
+        int width = std::max(1, static_cast<int>(std::ceil(w)));
+        int height = std::max(1, static_cast<int>(std::ceil(h)));
+        return std::make_pair(width, height);
+    }
+    return std::nullopt;
+}
+
+std::optional<ThemeImage::Svg> loadSvg(UnixFD &file) {
+    if (!file.isValid()) {
+        return std::nullopt;
+    }
+    GObjectUniquePtr<GInputStream> stream(
+        g_unix_input_stream_new(file.fd(), false));
+    if (!stream) {
+        return std::nullopt;
+    }
+    GObjectUniquePtr<RsvgHandle> handle(rsvg_handle_new_from_stream_sync(
+        stream.get(), nullptr, RSVG_HANDLE_FLAGS_NONE, nullptr, nullptr));
+    g_input_stream_close(stream.get(), nullptr, nullptr);
+    if (!handle) {
+        return std::nullopt;
+    }
+    auto size = svgSize(handle.get());
+    if (!size) {
+        return std::nullopt;
+    }
+    ThemeImage::Svg svg;
+    svg.width = size->first;
+    svg.height = size->second;
+    svg.handle = std::move(handle);
+    return svg;
+}
+
+bool isSvgPath(const std::filesystem::path &path) {
+    return path.extension() == ".svg" || path.extension() == ".svgz";
 }
 
 const std::vector<std::string> &gdkPixbufSupportedFormats() {
@@ -263,6 +307,133 @@ const std::vector<std::string> &gdkPixbufSupportedFormats() {
     return formats;
 }
 
+constexpr double RoundEpsilon = 1e-3;
+
+double pixelCeil(double f) { return std::ceil(f - RoundEpsilon); }
+double pixelFloor(double f) { return std::floor(f + RoundEpsilon); }
+
+void paintTile(cairo_t *c, int x, int y, int width, int height, double alpha,
+               const ThemeImage &image, int marginLeft, int marginTop,
+               int marginRight, int marginBottom) {
+
+    int resizeHeight = image.height() - marginTop - marginBottom;
+    int resizeWidth = image.width() - marginLeft - marginRight;
+
+    if (resizeHeight <= 0) {
+        resizeHeight = 1;
+    }
+
+    if (resizeWidth <= 0) {
+        resizeWidth = 1;
+    }
+
+    if (height < 0) {
+        height = resizeHeight;
+    }
+
+    if (width < 0) {
+        width = resizeWidth;
+    }
+    const auto targetResizeWidth = width - marginLeft - marginRight;
+    const auto targetResizeHeight = height - marginTop - marginBottom;
+
+    double sourceX[] = {0.0, static_cast<double>(marginLeft),
+                        static_cast<double>(image.width() - marginRight),
+                        static_cast<double>(image.width())};
+    double sourceY[] = {0.0, static_cast<double>(marginTop),
+                        static_cast<double>(image.height() - marginBottom),
+                        static_cast<double>(image.height())};
+
+    double gridX[] = {0.0, static_cast<double>(marginLeft),
+                      static_cast<double>(width - marginRight),
+                      static_cast<double>(width)};
+    double gridY[] = {0.0, static_cast<double>(marginTop),
+                      static_cast<double>(height - marginBottom),
+                      static_cast<double>(height)};
+    for (double &gx : gridX) {
+        gx += x;
+    }
+    for (double &gy : gridY) {
+        gy += y;
+    }
+
+    auto *surface = cairo_get_target(c);
+    double xScale;
+    double yScale;
+    cairo_surface_get_device_scale(surface, &xScale, &yScale);
+    for (int i = 0; i < 4; i++) {
+        if (i % 2 == 0) {
+            gridX[i] = pixelFloor(gridX[i] * xScale) / xScale;
+            gridY[i] = pixelFloor(gridY[i] * yScale) / yScale;
+        } else {
+            gridX[i] = pixelCeil(gridX[i] * xScale) / xScale;
+            gridY[i] = pixelCeil(gridY[i] * yScale) / yScale;
+        }
+    }
+
+    auto part = [&](int ix, int iy) {
+        double sx = sourceX[ix];
+        double sy = sourceY[iy];
+        double sw = sourceX[ix + 1] - sourceX[ix];
+        double sh = sourceY[iy + 1] - sourceY[iy];
+        double dx = gridX[ix];
+        double dy = gridY[iy];
+        double dw = gridX[ix + 1] - gridX[ix];
+        double dh = gridY[iy + 1] - gridY[iy];
+        if (dw > 0 && dh > 0) {
+            image.paintRegion(c, sx, sy, sw, sh, dx, dy, dw, dh, alpha);
+        }
+    };
+    /*
+     * 7 8 9
+     * 4 5 6
+     * 1 2 3
+     */
+
+    if (marginLeft && marginBottom) {
+        /* part 1 */
+        part(0, 2);
+    }
+
+    if (marginRight && marginBottom) {
+        /* part 3 */
+        part(2, 2);
+    }
+
+    if (marginLeft && marginTop) {
+        /* part 7 */
+        part(0, 0);
+    }
+
+    if (marginRight && marginTop) {
+        /* part 9 */
+        part(2, 0);
+    }
+
+    /* part 2 & 8 */
+    if (marginTop && targetResizeWidth > 0) {
+        part(1, 0);
+    }
+
+    if (marginBottom && targetResizeWidth > 0) {
+        part(1, 2);
+    }
+
+    /* part 4 & 6 */
+    if (marginLeft && targetResizeHeight > 0) {
+        part(0, 1);
+    }
+
+    if (marginRight && targetResizeHeight > 0) {
+        part(2, 1);
+    }
+
+    /* part 5 */
+    if (targetResizeHeight > 0 && targetResizeWidth > 0) {
+        part(1, 1);
+    }
+}
+
 } // namespace
 
 ThemeImage::ThemeImage(const IconTheme &iconTheme, const std::string &icon,
@@ -278,16 +449,22 @@ ThemeImage::ThemeImage(const IconTheme &iconTheme, const std::string &icon,
         std::filesystem::path iconPath =
             iconTheme.findIconPath(icon, size, 1, gdkPixbufSupportedFormats());
         auto fd = StandardPaths::openPath(iconPath);
-        image_.reset(loadImage(fd, iconPath));
-        if (image_ &&
-            cairo_surface_status(image_.get()) != CAIRO_STATUS_SUCCESS) {
-            image_.reset();
+        if (isSvgPath(iconPath)) {
+            if (auto svg = loadSvg(fd)) {
+                image_ = std::move(svg.value());
+            }
+        } else {
+            CairoSurface image = loadImage(fd, iconPath);
+            if (image) {
+                image_ = std::move(image);
+            }
         }
     }
-    if (!image_) {
-        image_.reset(
+    if (std::holds_alternative<std::monostate>(image_)) {
+        CairoSurface textImage(
             cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size, size));
-        drawTextIcon(image_.get(), label, size, classicui->config());
+        drawTextIcon(textImage.get(), label, size, classicui->config());
+        image_ = std::move(textImage);
     }
 }
 
@@ -301,12 +478,16 @@ ThemeImage::ThemeImage(const Theme &theme, const BackgroundImageConfig &cfg,
             theme.isSystemTheme() ? StandardPathsMode::System
                                   : StandardPathsMode::Default,
             &imagePath);
-        image_.reset(loadImage(imageFile, imagePath));
-        if (image_ &&
-            cairo_surface_status(image_.get()) != CAIRO_STATUS_SUCCESS) {
-            image_.reset();
+        if (isSvgPath(imagePath)) {
+            if (auto svg = loadSvg(imageFile)) {
+                image_ = std::move(svg.value());
+            }
+        } else {
+            CairoSurface image = loadImage(imageFile, imagePath);
+            if (image) {
+                image_ = std::move(image);
+            }
         }
-        valid_ = image_ != nullptr;
     }
 
     if (!cfg.overlay->empty()) {
@@ -317,14 +498,16 @@ ThemeImage::ThemeImage(const Theme &theme, const BackgroundImageConfig &cfg,
             theme.isSystemTheme() ? StandardPathsMode::System
                                   : StandardPathsMode::Default,
             &imagePath);
-        overlay_.reset(loadImage(imageFile, imagePath));
-        if (overlay_ &&
-            cairo_surface_status(overlay_.get()) != CAIRO_STATUS_SUCCESS) {
-            overlay_.reset();
+        if (isSvgPath(imagePath)) {
+            if (auto svg = loadSvg(imageFile)) {
+                overlay_ = std::move(svg.value());
+            }
+        } else if (auto overlay = loadImage(imageFile, imagePath)) {
+            overlay_ = std::move(overlay);
         }
     }
 
-    if (!image_) {
+    if (!valid()) {
         constexpr auto minimumSize = 20;
         auto width =
             *cfg.margin->marginLeft + *cfg.margin->marginRight +
@@ -344,22 +527,42 @@ ThemeImage::ThemeImage(const Theme &theme, const BackgroundImageConfig &cfg,
                           << width << " border=" << borderColor
                           << " border width=" << *cfg.borderWidth
                           << " color=" << color;
-        image_.reset(
-            cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height));
-        auto *cr = cairo_create(image_.get());
-        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-        if (borderWidth) {
-            cairoSetSourceColor(cr, borderColor);
-            cairo_paint(cr);
+        ThemeImage::Pattern pattern;
+        pattern.width = width;
+        pattern.height = height;
+        pattern.borderWidth = borderWidth;
+        pattern.pattern.reset(cairo_pattern_create_mesh());
+        const auto setPatch = [&](double x0, double y0, double x1, double y1,
+                                  const Color &color) {
+            cairo_mesh_pattern_begin_patch(pattern.pattern.get());
+            cairo_mesh_pattern_move_to(pattern.pattern.get(), x0, y0);
+            cairo_mesh_pattern_line_to(pattern.pattern.get(), x1, y0);
+            cairo_mesh_pattern_line_to(pattern.pattern.get(), x1, y1);
+            cairo_mesh_pattern_line_to(pattern.pattern.get(), x0, y1);
+            for (int i = 0; i < 4; i++) {
+                cairo_mesh_pattern_set_corner_color_rgba(
+                    pattern.pattern.get(), i, color.redF(), color.greenF(),
+                    color.blueF(), color.alphaF());
+            }
+            cairo_mesh_pattern_end_patch(pattern.pattern.get());
+        };
+        if (borderWidth > 0) {
+            const double x[] = {0.0, static_cast<double>(borderWidth),
+                                static_cast<double>(width - borderWidth),
+                                static_cast<double>(width)};
+            const double y[] = {0.0, static_cast<double>(borderWidth),
+                                static_cast<double>(height - borderWidth),
+                                static_cast<double>(height)};
+            for (int row = 0; row < 3; row++) {
+                for (int column = 0; column < 3; column++) {
+                    setPatch(x[column], y[row], x[column + 1], y[row + 1],
+                             (row == 1 && column == 1) ? color : borderColor);
+                }
+            }
+        } else {
+            setPatch(0, 0, width, height, color);
         }
-
-        cairo_rectangle(cr, borderWidth, borderWidth, width - (borderWidth * 2),
-                        height - (borderWidth * 2));
-        cairo_clip(cr);
-        cairoSetSourceColor(cr, color);
-        cairo_paint(cr);
-        cairo_destroy(cr);
-        isImage_ = true;
+        image_ = std::move(pattern);
     }
 }
 
@@ -372,12 +575,16 @@ ThemeImage::ThemeImage(const Theme &theme, const ActionImageConfig &cfg) {
             theme.isSystemTheme() ? StandardPathsMode::System
                                   : StandardPathsMode::Default,
             &imagePath);
-        image_.reset(loadImage(imageFile, imagePath));
-        if (image_ &&
-            cairo_surface_status(image_.get()) != CAIRO_STATUS_SUCCESS) {
-            image_.reset();
+        if (isSvgPath(imagePath)) {
+            if (auto svg = loadSvg(imageFile)) {
+                image_ = std::move(svg.value());
+            }
+        } else {
+            auto image = loadImage(imageFile, imagePath);
+            if (image) {
+                image_ = std::move(image);
+            }
         }
-        valid_ = image_ != nullptr;
     }
 }
 
@@ -424,6 +631,61 @@ void ThemeImage::drawTextIcon(cairo_surface_t *surface,
     cairo_restore(cr);
 
     cairo_destroy(cr);
+}
+
+void ThemeImage::paintRegion(cairo_t *c, double sourceX, double sourceY,
+                             double sourceWidth, double sourceHeight,
+                             double destX, double destY, double destWidth,
+                             double destHeight, double alpha,
+                             bool overlay) const {
+    if (sourceWidth <= 0 || sourceHeight <= 0 || destWidth <= 0 ||
+        destHeight <= 0) {
+        return;
+    }
+    const auto &source = overlay ? overlay_ : image_;
+    if (const auto *image = std::get_if<CairoSurface>(&source)) {
+        cairo_save(c);
+        cairo_rectangle(c, destX, destY, destWidth, destHeight);
+        cairo_clip(c);
+        cairo_translate(c, destX - (sourceX * destWidth / sourceWidth),
+                        destY - (sourceY * destHeight / sourceHeight));
+        cairo_scale(c, destWidth / sourceWidth, destHeight / sourceHeight);
+        cairo_set_source_surface(c, image->get(), 0, 0);
+        cairo_paint_with_alpha(c, alpha);
+        cairo_restore(c);
+        return;
+    }
+    if (const auto *svg = std::get_if<Svg>(&source)) {
+        cairo_save(c);
+        cairo_rectangle(c, destX, destY, destWidth, destHeight);
+        cairo_clip(c);
+        cairo_translate(c, destX - (sourceX * destWidth / sourceWidth),
+                        destY - (sourceY * destHeight / sourceHeight));
+        cairo_scale(c, destWidth / sourceWidth, destHeight / sourceHeight);
+        RsvgRectangle viewport{0, 0, static_cast<double>(svg->width),
+                               static_cast<double>(svg->height)};
+        cairo_push_group(c);
+        if (rsvg_handle_render_document(svg->handle.get(), c, &viewport,
+                                        nullptr)) {
+            cairo_pop_group_to_source(c);
+            cairo_paint_with_alpha(c, alpha);
+        } else {
+            cairo_pop_group(c);
+        }
+        cairo_restore(c);
+        return;
+    }
+    if (const auto *pattern = std::get_if<Pattern>(&source)) {
+        cairo_save(c);
+        cairo_rectangle(c, destX, destY, destWidth, destHeight);
+        cairo_clip(c);
+        cairo_translate(c, destX - (sourceX * destWidth / sourceWidth),
+                        destY - (sourceY * destHeight / sourceHeight));
+        cairo_scale(c, destWidth / sourceWidth, destHeight / sourceHeight);
+        cairo_set_source(c, pattern->pattern.get());
+        cairo_paint_with_alpha(c, alpha);
+        cairo_restore(c);
+    }
 }
 
 Theme::Theme() : iconTheme_(IconTheme::defaultIconThemeName()) {}
@@ -499,180 +761,18 @@ const ThemeImage &Theme::loadImage(const std::string &icon,
     return result.first->second;
 }
 
-void paintTile(cairo_t *c, int width, int height, double alpha,
-               cairo_surface_t *image, int marginLeft, int marginTop,
-               int marginRight, int marginBottom) {
-
-    int resizeHeight =
-        cairo_image_surface_get_height(image) - marginTop - marginBottom;
-    int resizeWidth =
-        cairo_image_surface_get_width(image) - marginLeft - marginRight;
-
-    if (resizeHeight <= 0) {
-        resizeHeight = 1;
-    }
-
-    if (resizeWidth <= 0) {
-        resizeWidth = 1;
-    }
-
-    if (height < 0) {
-        height = resizeHeight;
-    }
-
-    if (width < 0) {
-        width = resizeWidth;
-    }
-    const auto targetResizeWidth = width - marginLeft - marginRight;
-    const auto targetResizeHeight = height - marginTop - marginBottom;
-    const double scaleX = static_cast<double>(targetResizeWidth) / resizeWidth;
-    const double scaleY =
-        static_cast<double>(targetResizeHeight) / resizeHeight;
-    /*
-     * 7 8 9
-     * 4 5 6
-     * 1 2 3
-     */
-
-    if (marginLeft && marginBottom) {
-        /* part 1 */
-        cairo_save(c);
-        cairo_translate(c, 0, height - marginBottom);
-        cairo_set_source_surface(c, image, 0, -marginTop - resizeHeight);
-        cairo_rectangle(c, 0, 0, marginLeft, marginBottom);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    if (marginRight && marginBottom) {
-        /* part 3 */
-        cairo_save(c);
-        cairo_translate(c, width - marginRight, height - marginBottom);
-        cairo_set_source_surface(c, image, -marginLeft - resizeWidth,
-                                 -marginTop - resizeHeight);
-        cairo_rectangle(c, 0, 0, marginRight, marginBottom);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    if (marginLeft && marginTop) {
-        /* part 7 */
-        cairo_save(c);
-        cairo_set_source_surface(c, image, 0, 0);
-        cairo_rectangle(c, 0, 0, marginLeft, marginTop);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    if (marginRight && marginTop) {
-        /* part 9 */
-        cairo_save(c);
-        cairo_translate(c, width - marginRight, 0);
-        cairo_set_source_surface(c, image, -marginLeft - resizeWidth, 0);
-        cairo_rectangle(c, 0, 0, marginRight, marginTop);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    /* part 2 & 8 */
-    if (marginTop && targetResizeWidth > 0) {
-        cairo_save(c);
-        cairo_translate(c, marginLeft, 0);
-        cairo_scale(c, scaleX, 1);
-        cairo_set_source_surface(c, image, -marginLeft, 0);
-        cairo_rectangle(c, 0, 0, resizeWidth, marginTop);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    if (marginBottom && targetResizeWidth > 0) {
-        cairo_save(c);
-        cairo_translate(c, marginLeft, height - marginBottom);
-        cairo_scale(c, scaleX, 1);
-        cairo_set_source_surface(c, image, -marginLeft,
-                                 -marginTop - resizeHeight);
-        cairo_rectangle(c, 0, 0, resizeWidth, marginBottom);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    /* part 4 & 6 */
-    if (marginLeft && targetResizeHeight > 0) {
-        cairo_save(c);
-        cairo_translate(c, 0, marginTop);
-        cairo_scale(c, 1, scaleY);
-        cairo_set_source_surface(c, image, 0, -marginTop);
-        cairo_rectangle(c, 0, 0, marginLeft, resizeHeight);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    if (marginRight && targetResizeHeight > 0) {
-        cairo_save(c);
-        cairo_translate(c, width - marginRight, marginTop);
-        cairo_scale(c, 1, scaleY);
-        cairo_set_source_surface(c, image, -marginLeft - resizeWidth,
-                                 -marginTop);
-        cairo_rectangle(c, 0, 0, marginRight, resizeHeight);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-
-    /* part 5 */
-    if (targetResizeHeight > 0 && targetResizeWidth > 0) {
-        cairo_save(c);
-        cairo_translate(c, marginLeft, marginTop);
-        cairo_scale(c, scaleX, scaleY);
-        cairo_set_source_surface(c, image, -marginLeft, -marginTop);
-        cairo_pattern_set_filter(cairo_get_source(c), CAIRO_FILTER_NEAREST);
-        int w = resizeWidth;
-        int h = resizeHeight;
-
-        cairo_rectangle(c, 0, 0, w, h);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    }
-}
-
-void Theme::paint(cairo_t *c, const BackgroundImageConfig &cfg, int width,
-                  int height, double alpha, double scale) {
+void Theme::paint(cairo_t *c, const BackgroundImageConfig &cfg, int dx, int dy,
+                  int width, int height, double alpha) {
     const ThemeImage &image = loadBackground(cfg);
     auto marginTop = *cfg.margin->marginTop;
     auto marginBottom = *cfg.margin->marginBottom;
     auto marginLeft = *cfg.margin->marginLeft;
     auto marginRight = *cfg.margin->marginRight;
 
-    if (scale != 1.0) {
-        UniqueCPtr<cairo_surface_t, cairo_surface_destroy> background(
-            cairo_surface_create_similar_image(
-                cairo_get_target(c), CAIRO_FORMAT_ARGB32, width, height));
-        {
-            UniqueCPtr<cairo_t, cairo_destroy> backgroundC(
-                cairo_create(background.get()));
-            paintTile(backgroundC.get(), width, height, 1.0, image, marginLeft,
-                      marginTop, marginRight, marginBottom);
-        }
-        cairo_save(c);
-        cairo_rectangle(c, 0, 0, width, height);
-        cairo_set_source_surface(c, background.get(), 0, 0);
-        cairo_clip(c);
-        cairo_paint_with_alpha(c, alpha);
-        cairo_restore(c);
-    } else {
-        paintTile(c, width, height, alpha, image, marginLeft, marginTop,
-                  marginRight, marginBottom);
-    }
+    paintTile(c, dx, dy, width, height, alpha, image, marginLeft, marginTop,
+              marginRight, marginBottom);
 
-    if (!image.overlay()) {
+    if (!image.hasOverlay()) {
         return;
     }
 
@@ -700,7 +800,7 @@ void Theme::paint(cairo_t *c, const BackgroundImageConfig &cfg, int width,
     case Gravity::TopCenter:
     case Gravity::Center:
     case Gravity::BottomCenter:
-        x = (width - image.overlayWidth()) / 2 + *cfg.overlayOffsetX;
+        x = ((width - image.overlayWidth()) / 2) + *cfg.overlayOffsetX;
         break;
     case Gravity::TopRight:
     case Gravity::CenterRight:
@@ -717,7 +817,7 @@ void Theme::paint(cairo_t *c, const BackgroundImageConfig &cfg, int width,
     case Gravity::CenterLeft:
     case Gravity::Center:
     case Gravity::CenterRight:
-        y = (height - image.overlayHeight()) / 2 + *cfg.overlayOffsetY;
+        y = ((height - image.overlayHeight()) / 2) + *cfg.overlayOffsetY;
         break;
     case Gravity::BottomLeft:
     case Gravity::BottomCenter:
@@ -738,26 +838,22 @@ void Theme::paint(cairo_t *c, const BackgroundImageConfig &cfg, int width,
 
     cairo_save(c);
     cairo_set_operator(c, CAIRO_OPERATOR_OVER);
-    cairo_translate(c, finalRect.left(), finalRect.top());
-    cairo_set_source_surface(c, image.overlay(), x - finalRect.left(),
-                             y - finalRect.top());
-    cairo_rectangle(c, 0, 0, finalRect.width(), finalRect.height());
+    cairo_rectangle(c, finalRect.left(), finalRect.top(), finalRect.width(),
+                    finalRect.height());
     cairo_clip(c);
-    cairo_paint_with_alpha(c, alpha);
+    image.paintRegion(c, 0, 0, image.overlayWidth(), image.overlayHeight(), x,
+                      y, image.overlayWidth(), image.overlayHeight(), alpha,
+                      true);
     cairo_restore(c);
 }
 
 void Theme::paint(cairo_t *c, const ActionImageConfig &cfg, double alpha) {
     const ThemeImage &image = loadAction(cfg);
-    int height = cairo_image_surface_get_height(image);
-    int width = cairo_image_surface_get_width(image);
+    int height = image.height();
+    int width = image.width();
 
-    cairo_save(c);
-    cairo_set_source_surface(c, image, 0, 0);
-    cairo_rectangle(c, 0, 0, width, height);
-    cairo_clip(c);
-    cairo_paint_with_alpha(c, alpha);
-    cairo_restore(c);
+    image.paintRegion(c, 0, 0, image.width(), image.height(), 0, 0, width,
+                      height, alpha);
 }
 
 void Theme::reset() {
@@ -805,6 +901,9 @@ void Theme::load(std::string_view name) {
     maskConfig_ = *inputPanel->background;
     maskConfig_.overlay.setValue("");
     maskConfig_.image.setValue(*inputPanel->blurMask);
+    menuBlurMaskConfig_ = *menu->background;
+    menuBlurMaskConfig_.overlay.setValue("");
+    menuBlurMaskConfig_.image.setValue(*menu->blurMask);
     accentColorFields_ = std::unordered_set<ColorField>(
         accentColor.value().begin(), accentColor.value().end());
 }
@@ -831,7 +930,7 @@ std::vector<Rect> Theme::mask(const BackgroundImageConfig &cfg, int width,
         cairo_image_surface_create(CAIRO_FORMAT_A1, width, height));
     auto *c = cairo_create(mask.get());
     cairo_set_operator(c, CAIRO_OPERATOR_SOURCE);
-    paint(c, cfg, width, height, 1, 1);
+    paint(c, cfg, 0, 0, width, height, 1);
     cairo_destroy(c);
 
     UniqueCPtr<cairo_region_t, cairo_region_destroy> region(

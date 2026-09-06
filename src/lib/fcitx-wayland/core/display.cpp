@@ -14,6 +14,10 @@
 #include "wl_output.h"
 #include "wl_registry.h"
 
+#if defined(WL_FIXES_ACK_GLOBAL_REMOVE)
+#include "wl_fixes.h"
+#endif
+
 namespace fcitx::wayland {
 
 void Display::createGlobalHelper(
@@ -44,6 +48,9 @@ Display::Display(wl_display *display) : display_(display) {
             }
         });
     reg->globalRemove().connect([this](uint32_t name) {
+#if defined(WL_FIXES_ACK_GLOBAL_REMOVE)
+        std::shared_ptr<WlFixes> fixes = this->getGlobal<wayland::WlFixes>();
+#endif
         auto iter = globals_.find(name);
         if (iter != globals_.end()) {
             const auto &globalObject =
@@ -57,6 +64,12 @@ Display::Display(wl_display *display) : display_(display) {
             if (localGlobalIter != requestedGlobals_.end()) {
                 localGlobalIter->second->erase(name);
             }
+#if defined(WL_FIXES_ACK_GLOBAL_REMOVE)
+            if (fixes && fixes->actualVersion() >=
+                             WL_FIXES_ACK_GLOBAL_REMOVE_SINCE_VERSION) {
+                fixes->ackGlobalRemove(registry(), name);
+            }
+#endif
             globals_.erase(iter);
         }
     });
@@ -78,6 +91,9 @@ Display::Display(wl_display *display) : display_(display) {
         auto *output = static_cast<wayland::WlOutput *>(data.get());
         removeOutput(output);
     });
+#ifdef WL_FIXES_ACK_GLOBAL_REMOVE
+    requestGlobalsWithMinimalVersion<wayland::WlFixes>(2);
+#endif
 }
 
 Display::~Display() {}

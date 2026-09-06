@@ -15,7 +15,10 @@
 #include <pango/pango-layout.h>
 #include <pango/pango-types.h>
 #include <xcb/xcb.h>
+#include <yoga/YGConfig.h>
+#include <yoga/YGNode.h>
 #include "fcitx-utils/eventloopinterface.h"
+#include "fcitx-utils/misc.h"
 #include "fcitx-utils/rect.h"
 #include "fcitx-utils/signals.h"
 #include "fcitx-utils/trackableobject.h"
@@ -31,18 +34,26 @@ namespace fcitx::classicui {
 class MenuPool;
 
 struct MenuItem {
-    MenuItem(PangoContext *context) : layout_(pango_layout_new(context)) {}
+    MenuItem(PangoContext *context) : layout_(pango_layout_new(context)) {
+        self_.reset(YGNodeNew());
+        leading_.reset(YGNodeNew());
+        checkBox_.reset(YGNodeNew());
+        text_.reset(YGNodeNew());
+        subMenu_.reset(YGNodeNew());
+    }
 
     bool hasSubMenu_ = false;
     bool isHighlight_ = false;
     bool isSeparator_ = false;
     bool isChecked_ = false;
     GObjectUniquePtr<PangoLayout> layout_;
-    int layoutX_ = 0, layoutY_ = 0;
     Rect region_;
     int textWidth_ = 0, textHeight_ = 0;
-    int checkBoxX_ = 0, checkBoxY_ = 0;
-    int subMenuX_ = 0, subMenuY_ = 0;
+    UniqueCPtr<YGNode, YGNodeFree> self_;
+    UniqueCPtr<YGNode, YGNodeFree> leading_;
+    UniqueCPtr<YGNode, YGNodeFree> checkBox_;
+    UniqueCPtr<YGNode, YGNodeFree> text_;
+    UniqueCPtr<YGNode, YGNodeFree> subMenu_;
 };
 
 enum class ConstrainAdjustment { Slide, Flip };
@@ -92,27 +103,29 @@ private:
     void setHoveredIndex(int idx);
     void setChild(XCBMenu *child);
     void updateDPI(int x, int y);
+    void updateBlur();
     std::pair<MenuItem *, Action *> actionAt(size_t index);
+    void renderYogaNode(cairo_t *cr, YGNodeRef node);
 
     MenuPool *pool_;
 
     GObjectUniquePtr<PangoFontMap> fontMap_;
     GObjectUniquePtr<PangoContext> context_;
     std::vector<MenuItem> items_;
+    UniqueCPtr<YGNode, YGNodeFree> rootNode_;
 
     ScopedConnection destroyed_;
     TrackableObjectReference<InputContext> lastRelevantIc_;
     Menu *menu_;
     TrackableObjectReference<XCBMenu> parent_;
     TrackableObjectReference<XCBMenu> child_;
-    int dpi_ = -1;
-    double fontMapDefaultDPI_ = 96.0;
     int x_ = 0;
     int y_ = 0;
     bool hasMouse_ = false;
     bool visible_ = false;
     int subMenuIndex_ = -1;
     int hoveredIndex_ = -1;
+    xcb_atom_t atomBlur_;
     std::unique_ptr<EventSourceTime> activateTimer_;
 };
 

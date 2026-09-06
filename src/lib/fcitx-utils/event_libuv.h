@@ -7,6 +7,7 @@
 #ifndef _FCITX_UTILS_EVENT_LIBUV_H_
 #define _FCITX_UTILS_EVENT_LIBUV_H_
 
+#include <sys/types.h>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -17,6 +18,10 @@
 #include <fcitx-utils/macros.h>
 #include <fcitx-utils/trackableobject.h>
 #include <uv.h>
+
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
 
 namespace fcitx {
 
@@ -95,9 +100,7 @@ public:
         return state_ == LibUVSourceEnableState::Oneshot;
     }
 
-    inline HandleType *handle() {
-        return reinterpret_cast<HandleType *>(handle_);
-    }
+    HandleType *handle() { return reinterpret_cast<HandleType *>(handle_); }
 
     void init(uv_loop_t *loop) override {
         handle_ = static_cast<uv_handle_t *>(calloc(1, sizeof(HandleType)));

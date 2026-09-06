@@ -7,6 +7,7 @@
 #ifndef _FCITX_CONFIG_OPTION_H_
 #define _FCITX_CONFIG_OPTION_H_
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -107,7 +108,7 @@ private:
 struct FontAnnotation {
     bool skipDescription() { return false; }
     bool skipSave() { return false; }
-    void dumpDescription(RawConfig &config) {
+    void dumpDescription(RawConfig &config) const {
         config.setValueByPath("Font", "True");
     }
 };
@@ -157,9 +158,8 @@ struct ListConstrain {
     using ElementType = typename SubConstrain::Type;
     using Type = std::vector<ElementType>;
     bool check(const Type &value) {
-        return std::all_of(
-            value.begin(), value.end(),
-            [this](const ElementType &ele) { return sub_.check(ele); });
+        return std::ranges::all_of(
+            value, [this](const ElementType &ele) { return sub_.check(ele); });
     }
 
     void dumpDescription(RawConfig &config) const {
@@ -215,6 +215,20 @@ public:
 private:
     int min_;
     int max_;
+};
+
+/**
+ * String constrain that requires the value to be a valid regular expression.
+ * Use it directly on a String option, or wrapped in ListConstrain for a list
+ * of regular expressions. Frontends that understand the IsRegex marker can
+ * validate the value before saving, while other frontends simply treat it as a
+ * plain string and rely on this constrain to reject invalid values on save.
+ */
+class FCITXCONFIG_EXPORT RegexConstrain {
+public:
+    using Type = std::string;
+    bool check(const std::string &value) const;
+    void dumpDescription(RawConfig &config) const;
 };
 
 /// Key option constrain flag.
@@ -357,7 +371,7 @@ public:
 
     void dumpDescription(RawConfig &config) const override {
         OptionBase::dumpDescription(config);
-        if constexpr (not std::is_base_of_v<Configuration, T>) {
+        if constexpr (!std::is_base_of_v<Configuration, T>) {
             marshaller_.marshall(config["DefaultValue"], defaultValue_);
         }
         constrain_.dumpDescription(config);

@@ -12,6 +12,7 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -360,8 +361,18 @@ std::pair<int, int> InputWindow::update(InputContext *inputContext) {
     inputContext_ = inputContext->watch();
 
     cursor_ = -1;
-    auto preedit = instance->outputFilter(inputContext, inputPanel.preedit());
-    auto auxUp = instance->outputFilter(inputContext, inputPanel.auxUp());
+    Text preedit;
+    Text auxUp;
+    Text auxDown;
+    std::shared_ptr<CandidateList> candidateList;
+    if (!inputPanel.empty()) {
+        preedit = instance->outputFilter(inputContext, inputPanel.preedit());
+        auxUp = instance->outputFilter(inputContext, inputPanel.auxUp());
+        auxDown = instance->outputFilter(inputContext, inputPanel.auxDown());
+        candidateList = inputPanel.candidateList();
+    } else if (!inputPanel.overlayMessage().empty()) {
+        auxUp = inputPanel.overlayMessage();
+    }
     pango_layout_set_single_paragraph_mode(upperLayout_.get(), true);
     setTextToLayout(inputContext, upperLayout_.get(), nullptr, nullptr,
                     {auxUp, preedit});
@@ -370,11 +381,10 @@ std::pair<int, int> InputWindow::update(InputContext *inputContext) {
         cursor_ = preedit.cursor() + auxUp.toString().size();
     }
 
-    auto auxDown = instance->outputFilter(inputContext, inputPanel.auxDown());
     setTextToLayout(inputContext, lowerLayout_.get(), nullptr, nullptr,
                     {auxDown});
 
-    if (auto candidateList = inputPanel.candidateList()) {
+    if (candidateList) {
         // Count non-placeholder candidates.
         int count = 0;
 
@@ -504,13 +514,13 @@ std::pair<unsigned int, unsigned int> InputWindow::sizeHint() {
     return {width, height};
 }
 
-void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height,
-                        double scale) {
-    cairo_scale(cr, scale, scale);
+void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height) {
     auto &theme = parent_->theme();
-    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    theme.paint(cr, *theme.inputPanel->background, width, height, /*alpha=*/1.0,
-                scale);
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    theme.paint(cr, *theme.inputPanel->background, 0, 0, width, height,
+                /*alpha=*/1.0);
     const auto &margin = *theme.inputPanel->contentMargin;
     const auto &textMargin = *theme.inputPanel->textMargin;
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
@@ -602,14 +612,14 @@ void InputWindow::paint(cairo_t *cr, unsigned int width, unsigned int height,
         bool highlight = false;
         if (highlightIndex >= 0 && i == static_cast<size_t>(highlightIndex)) {
             cairo_save(cr);
-            cairo_translate(cr, candidateLeft - *highlightMargin.marginLeft,
-                            candidateTop - *highlightMargin.marginTop);
             theme.paint(cr, *theme.inputPanel->highlight,
+                        candidateLeft - *highlightMargin.marginLeft,
+                        candidateTop - *highlightMargin.marginTop,
                         highlightWidth + *highlightMargin.marginLeft +
                             *highlightMargin.marginRight,
                         candidateHeight + *highlightMargin.marginTop +
                             *highlightMargin.marginBottom,
-                        /*alpha=*/1.0, scale);
+                        /*alpha=*/1.0);
             cairo_restore(cr);
             highlight = true;
         }

@@ -7,6 +7,7 @@
  */
 
 #include "event_libuv.h"
+#include <sys/types.h>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -21,17 +22,25 @@
 #include "log.h"
 #include "trackableobject.h"
 
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
+
 #define FCITX_LIBUV_DEBUG() FCITX_LOGC(::fcitx::libuv_logcategory, Debug)
 
 namespace fcitx {
+
+namespace {
+
+FCITX_DEFINE_LOG_CATEGORY(libuv_logcategory, "libuv");
+
+}
 
 std::unique_ptr<EventLoopInterface> createDefaultEventLoop() {
     return std::make_unique<EventLoopLibUV>();
 }
 
 const char *defaultEventLoopImplementation() { return "libuv"; }
-
-FCITX_DEFINE_LOG_CATEGORY(libuv_logcategory, "libuv");
 
 static int IOEventFlagsToLibUVFlags(IOEventFlags flags) {
     int result = 0;

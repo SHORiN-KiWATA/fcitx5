@@ -33,9 +33,11 @@
 #include "fcitx/inputcontextmanager.h"
 #include "fcitx/inputpanel.h"
 #include "fcitx/instance.h"
+#include "fcitx/tempmodemanager.h"
 #include "fcitx/text.h"
 #include "fcitx/userinterface.h"
 #include "clipboardentry.h"
+#include "clipboardtempmode.h"
 
 #ifdef ENABLE_X11
 #include <xcb/xcb.h>
@@ -53,6 +55,7 @@ namespace fcitx {
 namespace {
 
 constexpr uint64_t oneSecond = 1000000ULL;
+constexpr char threeDot[] = "\xe2\x80\xa6";
 
 bool shouldClearPassword(const ClipboardEntry &entry, uint64_t life) {
     if (entry.passwordTimestamp == 0 || life == 0) {
@@ -60,30 +63,9 @@ bool shouldClearPassword(const ClipboardEntry &entry, uint64_t life) {
         return false;
     }
     // Allow 0.5 second skew.
-    return (entry.passwordTimestamp + life * oneSecond - oneSecond / 2) <=
+    return (entry.passwordTimestamp + (life * oneSecond) - (oneSecond / 2)) <=
            now(CLOCK_MONOTONIC);
 }
-
-} // namespace
-
-FCITX_DEFINE_LOG_CATEGORY(clipboard_log, "clipboard");
-
-class ClipboardState : public InputContextProperty {
-public:
-    ClipboardState(Clipboard *q) : q_(q) {}
-
-    bool enabled_ = false;
-    Clipboard *q_;
-
-    void reset(InputContext *ic) {
-        enabled_ = false;
-        ic->inputPanel().reset();
-        ic->updatePreedit();
-        ic->updateUserInterface(UserInterfaceComponent::InputPanel);
-    }
-};
-
-constexpr char threeDot[] = "\xe2\x80\xa6";
 
 std::string ClipboardSelectionStrip(const std::string &text) {
     if (!utf8::validate(text)) {
@@ -126,6 +108,10 @@ std::string ClipboardSelectionStrip(const std::string &text) {
     return result;
 }
 
+} // namespace
+
+FCITX_DEFINE_LOG_CATEGORY(clipboard_log, "clipboard");
+
 class ClipboardCandidateWord : public CandidateWord {
 public:
     ClipboardCandidateWord(Clipboard *q, const std::string &str, bool password)
@@ -149,20 +135,15 @@ public:
     }
 
     void select(InputContext *inputContext) const override {
-        auto *state = inputContext->propertyFor(&q_->factory());
         inputContext->commitString(str_);
-        state->reset(inputContext);
+        q_->reset(inputContext);
     }
 
     Clipboard *q_;
     std::string str_;
 };
 
-Clipboard::Clipboard(Instance *instance)
-    : instance_(instance),
-      factory_([this](InputContext &) { return new ClipboardState(this); }) {
-    instance_->inputContextManager().registerProperty("clipboardState",
-                                                      &factory_);
+Clipboard::Clipboard(Instance *instance) : instance_(instance) {
 #ifdef ENABLE_X11
     if (auto *xcb = this->xcb()) {
         xcbCreatedCallback_ =
@@ -204,144 +185,19 @@ Clipboard::Clipboard(Instance *instance)
     for (auto sym : syms) {
         selectionKeys_.emplace_back(sym, states);
     }
-    eventHandlers_.emplace_back(instance_->watchEvent(
-        EventType::InputContextKeyEvent, EventWatcherPhase::Default,
-        [this](Event &event) {
-            auto &keyEvent = static_cast<KeyEvent &>(event);
-            if (keyEvent.isRelease()) {
-                return;
-            }
-            if (keyEvent.key().checkKeyList(config_.triggerKey.value())) {
-                trigger(keyEvent.inputContext());
-                keyEvent.filterAndAccept();
-                return;
-            }
-            if (keyEvent.key().checkKeyList(config_.pastePrimaryKey.value())) {
-                keyEvent.inputContext()->commitString(
-                    primary(keyEvent.inputContext()));
-                keyEvent.filterAndAccept();
-                return;
-            }
-        }));
-
-    auto reset = [this](Event &event) {
-        auto &icEvent = static_cast<InputContextEvent &>(event);
-        auto *state = icEvent.inputContext()->propertyFor(&factory_);
-        if (state->enabled_) {
-            state->reset(icEvent.inputContext());
-        }
-    };
-    eventHandlers_.emplace_back(instance_->watchEvent(
-        EventType::InputContextFocusOut, EventWatcherPhase::Default, reset));
-    eventHandlers_.emplace_back(instance_->watchEvent(
-        EventType::InputContextReset, EventWatcherPhase::Default, reset));
+    tempMode_ = std::make_unique<ClipboardTempMode>(this);
+    instance_->tempModeManager().registerTempMode(*tempMode_);
     eventHandlers_.emplace_back(
-        instance_->watchEvent(EventType::InputContextSwitchInputMethod,
-                              EventWatcherPhase::Default, reset));
-    eventHandlers_.emplace_back(instance_->watchEvent(
-        EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
-        [this](Event &event) {
-            auto &keyEvent = static_cast<KeyEvent &>(event);
-            auto *inputContext = keyEvent.inputContext();
-            auto *state = inputContext->propertyFor(&factory_);
-            if (!state->enabled_) {
-                return;
-            }
-
-            // make sure no one else will handle it
-            keyEvent.filter();
-            if (keyEvent.isRelease()) {
-                return;
-            }
-
-            auto candidateList = inputContext->inputPanel().candidateList();
-            if (candidateList) {
-                int idx = keyEvent.key().digitSelection();
-                if (idx >= 0) {
-                    keyEvent.accept();
-                    if (idx < candidateList->size()) {
-                        candidateList->candidate(idx).select(inputContext);
-                    }
-                    return;
-                }
-                if (keyEvent.key().check(FcitxKey_space) ||
-                    keyEvent.key().check(FcitxKey_Return) ||
-                    keyEvent.key().check(FcitxKey_KP_Enter)) {
-                    keyEvent.accept();
-                    if (!candidateList->empty() &&
-                        candidateList->cursorIndex() >= 0) {
-                        candidateList->candidate(candidateList->cursorIndex())
-                            .select(inputContext);
-                    }
-                    return;
-                }
-
-                if (keyEvent.key().checkKeyList(
-                        instance_->globalConfig().defaultPrevPage())) {
-                    auto *pageable = candidateList->toPageable();
-                    if (!pageable->hasPrev()) {
-                        if (pageable->usedNextBefore()) {
-                            event.accept();
-                            return;
-                        }
-                    } else {
-                        event.accept();
-                        pageable->prev();
-                        inputContext->updateUserInterface(
-                            UserInterfaceComponent::InputPanel);
-                        return;
-                    }
-                }
-
-                if (keyEvent.key().checkKeyList(
-                        instance_->globalConfig().defaultNextPage())) {
+        instance_->watchEvent<EventType::InputContextKeyEvent>(
+            EventWatcherPhase::Default, [this](KeyEvent &keyEvent) {
+                if (!keyEvent.isRelease() &&
+                    keyEvent.key().checkKeyList(
+                        config_.pastePrimaryKey.value())) {
+                    keyEvent.inputContext()->commitString(
+                        primary(keyEvent.inputContext()));
                     keyEvent.filterAndAccept();
-                    candidateList->toPageable()->next();
-                    inputContext->updateUserInterface(
-                        UserInterfaceComponent::InputPanel);
-                    return;
                 }
-
-                if (keyEvent.key().checkKeyList(
-                        instance_->globalConfig().defaultPrevCandidate())) {
-                    keyEvent.filterAndAccept();
-                    candidateList->toCursorMovable()->prevCandidate();
-                    inputContext->updateUserInterface(
-                        UserInterfaceComponent::InputPanel);
-                    return;
-                }
-
-                if (keyEvent.key().checkKeyList(
-                        instance_->globalConfig().defaultNextCandidate())) {
-                    keyEvent.filterAndAccept();
-                    candidateList->toCursorMovable()->nextCandidate();
-                    inputContext->updateUserInterface(
-                        UserInterfaceComponent::InputPanel);
-                    return;
-                }
-            }
-
-            // and by pass all modifier
-            if (keyEvent.key().isModifier() || keyEvent.key().hasModifier()) {
-                return;
-            }
-            if (keyEvent.key().check(FcitxKey_Escape)) {
-                keyEvent.accept();
-                state->reset(inputContext);
-                return;
-            }
-            if (keyEvent.key().check(FcitxKey_Delete) ||
-                keyEvent.key().check(FcitxKey_BackSpace)) {
-                keyEvent.accept();
-                history_.clear();
-                primary_.clear();
-                state->reset(inputContext);
-                return;
-            }
-            event.accept();
-
-            updateUI(inputContext);
-        }));
+            }));
     clearPasswordTimer_ = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC, now(CLOCK_MONOTONIC), 0,
         [this](EventSourceTime *, uint64_t) {
@@ -358,10 +214,13 @@ void Clipboard::reloadConfig() {
     refreshPasswordTimer();
 }
 
-void Clipboard::trigger(InputContext *inputContext) {
-    auto *state = inputContext->propertyFor(&factory_);
-    state->enabled_ = true;
-    updateUI(inputContext);
+void Clipboard::clear() {
+    history_.clear();
+    primary_.clear();
+}
+
+void Clipboard::reset(InputContext *inputContext) {
+    tempMode_->reset(inputContext);
 }
 void Clipboard::updateUI(InputContext *inputContext) {
     inputContext->inputPanel().reset();

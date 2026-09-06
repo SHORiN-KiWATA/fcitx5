@@ -12,7 +12,7 @@ public:
     static constexpr const char *interface = "wl_data_source";
     static constexpr const wl_interface *const wlInterface =
         &wl_data_source_interface;
-    static constexpr const uint32_t version = 3;
+    static constexpr const uint32_t version = 4;
     using wlType = wl_data_source;
     operator wl_data_source *() { return data_.get(); }
     WlDataSource(wlType *data);
@@ -21,8 +21,12 @@ public:
     auto actualVersion() const { return version_; }
     void *userData() const { return userData_; }
     void setUserData(void *userData) { userData_ = userData; }
+#if defined(WL_DATA_SOURCE_OFFER_SINCE_VERSION)
     void offer(const char *mimeType);
+#endif
+#if defined(WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION)
     void setActions(uint32_t dndActions);
+#endif
 
     auto &target() { return targetSignal_; }
     auto &send() { return sendSignal_; }

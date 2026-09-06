@@ -11,7 +11,7 @@ public:
     static constexpr const char *interface = "wl_region";
     static constexpr const wl_interface *const wlInterface =
         &wl_region_interface;
-    static constexpr const uint32_t version = 1;
+    static constexpr const uint32_t version = 7;
     using wlType = wl_region;
     operator wl_region *() { return data_.get(); }
     WlRegion(wlType *data);
@@ -20,8 +20,12 @@ public:
     auto actualVersion() const { return version_; }
     void *userData() const { return userData_; }
     void setUserData(void *userData) { userData_ = userData; }
+#if defined(WL_REGION_ADD_SINCE_VERSION)
     void add(int32_t x, int32_t y, int32_t width, int32_t height);
+#endif
+#if defined(WL_REGION_SUBTRACT_SINCE_VERSION)
     void subtract(int32_t x, int32_t y, int32_t width, int32_t height);
+#endif
 
 private:
     static void destructor(wl_region *);

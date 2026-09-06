@@ -7,6 +7,7 @@
 #ifndef _FCITX_UTILS_EVENTLOOPINTERFACE_H_
 #define _FCITX_UTILS_EVENTLOOPINTERFACE_H_
 
+#include <sys/types.h>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -14,6 +15,10 @@
 #include <fcitx-utils/fcitxutils_export.h>
 #include <fcitx-utils/flags.h>
 #include <fcitx-utils/macros.h>
+
+#if defined(_WIN32)
+#include <pthread.h>
+#endif
 
 namespace fcitx {
 

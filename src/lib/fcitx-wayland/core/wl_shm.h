@@ -13,7 +13,7 @@ class WlShm final {
 public:
     static constexpr const char *interface = "wl_shm";
     static constexpr const wl_interface *const wlInterface = &wl_shm_interface;
-    static constexpr const uint32_t version = 2;
+    static constexpr const uint32_t version = 3;
     using wlType = wl_shm;
     operator wl_shm *() { return data_.get(); }
     WlShm(wlType *data);
@@ -22,7 +22,9 @@ public:
     auto actualVersion() const { return version_; }
     void *userData() const { return userData_; }
     void setUserData(void *userData) { userData_ = userData; }
+#if defined(WL_SHM_CREATE_POOL_SINCE_VERSION)
     WlShmPool *createPool(int32_t fd, int32_t size);
+#endif
 
     auto &format() { return formatSignal_; }
 

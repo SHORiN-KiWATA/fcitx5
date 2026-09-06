@@ -43,6 +43,13 @@ void VirtualInputContextGlue::focusOutWrapper() {
     }
 }
 
+void VirtualInputContextGlue::resetWrapper() {
+    reset();
+    if (auto *ic = delegatedInputContext(); ic != this) {
+        ic->reset();
+    }
+}
+
 void VirtualInputContextGlue::updateSurroundingTextWrapper() {
     updateSurroundingText();
     if (auto *ic = delegatedInputContext(); ic != this) {
@@ -100,6 +107,7 @@ void VirtualInputContextManager::updateFocus() {
         // forward capability flags on focus in.
         if (ic != parentIC_) {
             ic->setCapabilityFlags(parentIC_->capabilityFlags());
+            ic->setCursorRect(parentIC_->cursorRect());
             ic->surroundingText() = parentIC_->surroundingText();
             ic->updateSurroundingText();
         }

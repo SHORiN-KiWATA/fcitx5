@@ -14,7 +14,7 @@ public:
     static constexpr const char *interface = "wl_compositor";
     static constexpr const wl_interface *const wlInterface =
         &wl_compositor_interface;
-    static constexpr const uint32_t version = 6;
+    static constexpr const uint32_t version = 7;
     using wlType = wl_compositor;
     operator wl_compositor *() { return data_.get(); }
     WlCompositor(wlType *data);
@@ -23,8 +23,12 @@ public:
     auto actualVersion() const { return version_; }
     void *userData() const { return userData_; }
     void setUserData(void *userData) { userData_ = userData; }
+#if defined(WL_COMPOSITOR_CREATE_SURFACE_SINCE_VERSION)
     WlSurface *createSurface();
+#endif
+#if defined(WL_COMPOSITOR_CREATE_REGION_SINCE_VERSION)
     WlRegion *createRegion();
+#endif
 
 private:
     static void destructor(wl_compositor *);

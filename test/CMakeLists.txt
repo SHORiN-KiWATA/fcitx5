@@ -28,7 +28,8 @@ set(FCITX_UTILS_TEST
     testfallbackuuid
     testsemver
     testenviron
-    testfdstreambuf)
+    testfdstreambuf
+    testcoroutine)
 
 if (WIN32)
     list(APPEND FCITX_UTILS_TEST teststandardpaths_win)
@@ -65,6 +66,11 @@ if (ENABLE_DBUS)
     add_executable(DBusWrapper IMPORTED)
     set_target_properties(DBusWrapper PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/dbus_wrapper.sh")
 
+    add_test(NAME testremotehelp
+             COMMAND ${CMAKE_COMMAND} -E env
+                     "DBUS_SESSION_BUS_ADDRESS=unix:path=${CMAKE_CURRENT_BINARY_DIR}/nonexistent-dbus"
+                     $<TARGET_FILE:fcitx5-remote> --help)
+
     foreach(TESTCASE ${FCITX_UTILS_DBUS_TEST})
         add_executable(${TESTCASE} ${TESTCASE}.cpp)
         target_link_libraries(${TESTCASE} Fcitx5::Utils ${${TESTCASE}_LIBS})
@@ -100,6 +106,7 @@ endforeach()
 
 set(testinputcontext_LIBS Fcitx5::Module::TestFrontend Fcitx5::Module::TestIM)
 set(testinstance_LIBS Fcitx5::Module::TestFrontend)
+set(testtempmode_LIBS Fcitx5::Module::TestFrontend Fcitx5::Module::TestIM)
 
 set(FCITX_CORE_TEST
     testinputcontext
@@ -111,7 +118,8 @@ set(FCITX_CORE_TEST
     testcandidatelist
     testicontheme
     testtext
-    testinstance)
+    testinstance
+    testtempmode)
 
 foreach(TESTCASE ${FCITX_CORE_TEST})
     add_executable(${TESTCASE} ${TESTCASE}.cpp)
@@ -123,6 +131,7 @@ endforeach()
 add_dependencies(testaddon dummyaddon)
 add_dependencies(testinstance copy-addon testfrontend testim)
 add_dependencies(testinputcontext copy-addon testfrontend testim)
+add_dependencies(testtempmode copy-addon testfrontend testim)
 
 if (ENABLE_KEYBOARD)
     add_executable(testxkbrules testxkbrules.cpp ../src/im/keyboard/xkbrules.cpp ../src/im/keyboard/xmlparser.cpp)

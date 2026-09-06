@@ -13,6 +13,7 @@
 #include <xcb/xproto.h>
 #include "fcitx-utils/handlertable.h"
 #include "fcitx-utils/misc.h"
+#include "fcitx-utils/rect.h"
 #include "window.h"
 #include "xcb_public.h"
 #include "xcbui.h"
@@ -35,8 +36,16 @@ public:
     virtual bool filterEvent(xcb_generic_event_t *event) = 0;
 
     xcb_window_t wid() const { return wid_; }
+    void setScale(double scale);
 
 protected:
+    double logicalFromPhysical(double value) const;
+    double physicalFromLogical(double value) const;
+    // X11 window dimensions must be at least one pixel.
+    int physicalSizeFromLogical(double size) const;
+    Rect physicalFromLogical(const Rect &rect) const;
+    static double scaleForDPI(int dpi);
+
     XCBUI *ui_;
     xcb_window_t wid_ = 0;
     xcb_colormap_t colorMapNeedFree_ = 0;
@@ -44,6 +53,9 @@ protected:
     std::unique_ptr<HandlerTableEntry<XCBEventFilter>> eventFilter_;
     UniqueCPtr<cairo_surface_t, cairo_surface_destroy> surface_;
     UniqueCPtr<cairo_surface_t, cairo_surface_destroy> contentSurface_;
+    int physicalWidth_ = 1;
+    int physicalHeight_ = 1;
+    double scale_ = 1.0;
 };
 
 } // namespace fcitx::classicui
