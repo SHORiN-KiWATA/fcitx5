@@ -658,8 +658,8 @@ void XIMServer::callback(xcb_im_client_t *client, xcb_im_input_context_t *xic,
             // character leaks under CJK locales with COMPOUND_TEXT encoding.
             if (!(event.isRelease() &&
                   !event.key().states().testAny(
-                      KeyStates{KeyState::Ctrl, KeyState::Alt,
-                                KeyState::Super, KeyState::Shift}) &&
+                      KeyStates{KeyState::Ctrl, KeyState::Alt, KeyState::Super,
+                                KeyState::Shift}) &&
                   !ic->inputPanel().preedit().toString().empty() &&
                   Key::keySymToUnicode(event.key().sym()) > 0x20)) {
                 xcb_im_forward_event(im(), xic, xevent);
